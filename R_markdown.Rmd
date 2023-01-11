@@ -1,0 +1,533 @@
+---
+title: "Detect counterfeit bills with R"
+author: "Corentin Casali"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document: default
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+# Project Background
+The National Organization for Combating Counterfeiting Currency, (ONCFM in French), is a public organization whose objective is to implement methods for identifying counterfeit euro bills. As part of this fight, we want to implement an algorithm that is able to automatically differentiate between real and counterfeit bills.
+
+## Scenario
+Data Analyst Consultant in a company specialized in data. Your company has won a contract with the National Organization for Combating Counterfeiting Currency (ONCFM).
+
+The objective of this institution is to set up methods to identify counterfeit euro banknotes. So they call on you, data specialist, to set up a model that would be able to automatically identify the real ones from the counterfeits. And this simply from certain dimensions of the banknote and the elements that compose it.
+
+```{r, message=FALSE}
+## First specify the packages of interest
+packages = c("knitr","readr","dplyr","kableExtra",'stringi','tidyverse','corrplot','psych','reshape2','GGally', 'performance', 'FactoMineR','factoextra', 'MASS','broom', "caret","blorr","rstudioapi","pROC","clue")
+
+## Now load or install&load all
+package.check <- lapply(
+  packages,
+  FUN = function(x) {
+    if (!require(x, character.only = TRUE)) {
+      install.packages(x, dependencies = TRUE)
+      library(x, character.only = TRUE)
+    }
+  }
+)
+
+setwd(dirname(getActiveDocumentContext()$path)) # set as working directory 
+knitr::opts_chunk$set(echo=TRUE, fig.height = 8, fig.width = 12, fig.align = "center")
+```
+
+# Imports and data preparation 
+The ONCFM provides us with the data concerning the banknotes We will import them to be able to process and analyze them. 
+```{r}
+# Reading Data
+df_billet <- read.csv2("data/billets.csv", sep = ";", dec = ".")
+
+# Visualization of the dataframe
+str(df_billet) # info about data
+summary(df_billet) # info about numeric data
+
+# Missing data
+sapply(df_billet, function(x) sum(is.na(x)))
+```
+We see that the dataframe contains **`r dim(df_billet)[1]`** tickets with **`r dim(df_billet)[2]`** different variables. The variables are: 
+
+* **is_genuine** : the nature of the banknote. I.e. if the bill is true or false.
+* **diagonal** : the diagonal of the banknote (in mm)
+**height_left** & **height_right** : the height of the banknote (left or right, in mm)
+**margin_low** & **margin_up** : the margin between the edge (top or bottom) and the banknote image (in mm)
+* **length** : the length of the banknote (in mm)
+
+Data for the **margin_low** variable is missing, namely `r sum(sapply(df_billet, function(x) sum(is.na(x))))` values in the dataframe. 
+Concerning the other variables, we have no outliers with negative or too large distances. 
+
+We will just modify the variable **is_genuine** to put it in factor and then make a graphical representation of the quantitative variables according to the nature of the banknote 
+```{r, warning=FALSE}
+# Factor is_genuine
+df_billet$is_genuine = factor(df_billet$is_genuine, levels = c("True","False"), labels = c("vrai_billet","faux_billet"))
+
+# Groupby | groupe
+df_billet %>%
+  group_by(is_genuine)%>%
+  summarise_all("mean", na.rm=TRUE) %>% as.data.frame()
+
+# Graphic visualization of the different variables [BOXPLOT].
+df_boxplot <- df_billet %>% gather(-is_genuine, key ="var", value ="value")
+ggplot(df_boxplot, aes (x = is_genuine, y=value, fill = is_genuine))+
+  scale_fill_manual(values=c("#91FFB4","#FFCAC9"))+
+  facet_wrap(~var, scales = "free")+
+  geom_boxplot()+
+  coord_flip()+
+  theme_bw()
+
+# Visualization of the few missing data :
+kable(head(df_billet[is.na(df_billet$margin_low),],6))%>%
+  kable_styling(latex_options = 'striped')
+```
+Concerning the boxplot, we can see that some variables will have a greater impact on the detection of counterfeit bills with notably **lenght** and **margin_low**. 
+
+For the treatment of the missing values, we have to choose a solution. Wanting to apply a Machine Learning algorithm, we need a complete dataset without any missing variable. To process its values, we will use a **linear regression** which was proposed to us by a colleague of the ONCFM. He tells us that he has obtained good results with this method, so we will use this method. 
+
+For our linear regression, we will use several explanatory variables for one dependent variable which will be **margin_low** here because it is the variable with missing values.
+
+### Removing missing data & Correlation matrix [+ Pairplot]
+```{r}
+# Removing missing data from a dataframe
+df_billet_dropna.full <- df_billet %>% drop_na
+
+# Get the lower triangle in the correlation matrix
+  get_lower_tri<-function(cormat){
+    cormat[upper.tri(cormat)] <- NA
+    return(cormat)
+  }
+# Linear correlation matrix
+melted_cormat <- melt(get_lower_tri(round(cor(df_billet_dropna.full[,-1],use='complete.obs'),2)), na.rm = TRUE)
+
+ggplot(data = melted_cormat,
+       aes(Var1, Var2, fill=value)) +
+geom_tile(color = "white")+
+ scale_fill_gradient2(low = "red", high = "blue", mid = "white",
+   midpoint = 0, limit = c(-1,1),
+   name="Pearson\nCorrelation") +
+  theme_classic()+
+ theme(axis.text.x =
+         element_text(angle = 45, vjust = 1, size = 12, hjust = 1),
+       axis.text.y =
+         element_text(size=12))+
+ coord_fixed()+
+  geom_text(aes(Var1,Var2, label = value), color = "black", size =4)+
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+  )
+
+# pairplot
+ggpairs(df_billet_dropna.full,             # Dataframe
+        columns = 2:7,         # Columns          
+        aes(color=is_genuine, # Color by group
+        alpha = 0.5)
+        )
+```
+**length** is the variable that has the highest correlation with **margin_low** (negative). As a reminder, these are the two variables we noticed during the boxplot. 
+
+### Multiple linear regression
+We will use stepwise regression (or stepwise selection) which consists in iteratively adding and removing predictors, in the predictive model, in order to find the subset of variables in the data set that gives the best performing model, i.e. a model that reduces the prediction error and the risks of overlearning. 
+
+There are different methods in stepwise regression, and we will use : **stepwise-selection**; which is a combination of forward and backward selections. We start with no predictors, then sequentially add the most contributing predictors (forward). After adding each new variable, all variables that no longer improve the model fit are removed (backward).
+
+**Separation of the dataframe in two: train | test**. 
+```{r}
+# Removing the is_genuine variable for multiple linear regression
+df_billet_dropna <- df_billet_dropna.full[-1]
+
+# Partition of data into a train dataframe and a test dataframe
+# set.seed
+set.seed(123)
+
+# Partition at 80% in the train data and 20% for the test data.
+row.number <- sample(1:nrow(df_billet_dropna), 0.8*nrow(df_billet_dropna))
+train <- df_billet_dropna[row.number,]
+test <- df_billet_dropna[-row.number,]
+
+# Fit the complete model with "margin_low" on the "train" data
+full.model <- lm(margin_low ~., data = train)
+
+# Stepwise regression model with the full model
+step.model <- stepAIC(full.model, direction = "both", 
+                      trace = FALSE)
+summary(step.model)
+
+broom::glance(step.model)
+```
+Here we see that all parameters are significant , as their p-values are less than 5%, the level of testing we desire.
+The 𝑅² is about 0.48, and the adjusted 𝑅² is about 0.48.
+This value is higher than in simple linear regression, and this makes sense, because when we add potential explanatory variables, we naturally increase the value of these 𝑅².
+
+Nevertheless this does not mean whether our model is significant or not. This is why we look at the p-value of the F-statistic. This one is very low (less than 1%), so we reject the null hypothesis and our model is therefore significant. 
+
+In the choice of models, we need the AIC (Akaike Information Criterion) with the lowest value. This is the model with the lowest AIC found among other models. 
+
+We will now evaluate the multicollinearity by the VIF (Variance Inflation Factor).
+
+#### Evaluation of multicollinearities by the VIF
+```{r}
+# Check VIF :
+check_collinearity(step.model)
+```
+When a variable has a VIF > 10, it is necessary to remove it from the model, then recalculate the VIFs, and remove a second variable if necessary, etc... until we obtain only VIFs < 5. In our case, all our variables have a VIF < 5 so we remove no variable in our model. 
+
+#### Evaluation of the hypotheses of normality and homoscedasticity of the residuals
+```{r}
+# Check model
+check_model(step.model)
+
+# residual analysis
+billet.residuals <- data.frame(residuals = step.model$residuals)
+# Histogram overlaid with Kernel density Curve
+billet.residuals %>% ggplot(aes(x=residuals))+
+  geom_histogram(aes(y=..density..),
+                 binwidth=.05,
+                 colour = 'black',fill="steelblue")+
+  geom_density(alpha = .2, fill = "red")
+```
+The linearity suffers from a slight defect, but seems acceptable in view of the distinction between the nature of the bill. 
+The homoscedasticity is not perfect but still seems reasonable. 
+
+The normality with the QQ-plot is more than logical because of the difference in nature, for me there is no concern about normality. 
+
+Nevertheless, the observation of the residuals, the fact that they are not very different from a symmetrical distribution, and the fact that the sample size is large enough (more than 30) allow us to say that the results obtained by the linear Gaussian model are not absurd, even if the residual is not considered as Gaussian.
+
+### Application of the model on the test basis:
+```{r}
+x = model.matrix(margin_low~.,df_billet_dropna)  # values without margin_low
+y = as.matrix(df_billet_dropna$margin_low) # values with margin_low
+colnames(y) = "margin_low"
+
+train_a = as.integer(rownames(train)) # dataframe train index
+test_a = as.integer(rownames(test)) # dataframe test index
+
+# Application of the reg model on the test base
+
+mod.coef = step.model$coefficients # coefficients 
+mod.pred = predict(step.model,newdata=data.frame(x)) # predictions on the test set
+reg_mse <- mean((mod.pred[test_a]-y[test_a])^2) # Test MSE
+reg_mse
+mod.coef
+```
+The smaller the MSE score, the better the model. With a score of 0.20, this means that the model is good. 
+We can now impute the data, in the missing data. 
+
+#### Imputation of missing data in the original dataframe
+```{r}
+# Imputation of missing data
+df_billet_nan <- df_billet %>% filter(if_any(everything(), is.na)) # dataframe with missing data 
+
+predict_value <- predict(step.model,newdata = df_billet_nan) # prediction with the model on missing data
+
+df_billet$margin_low[which(is.na(df_billet$margin_low))] <- predict_value  # replacement of missing values, by the model prediction
+
+summary(df_billet)
+```
+We no longer have any missing data. We can now proceed to the automatic counterfeit detection algorithm. 
+
+## Automatic counterfeit detection algorithm
+We need to compete two prediction methods:
+
+* a k-means, from which the centroids will be used to perform the prediction ;
+* a classical logistic regression
+
+For an optimal evaluation of the models, it will be necessary to use an analysis of the numbers of false positives and false negatives via a confusion matrix of the two methods. 
+
+### Visualization with PCA - Principal Component Analysis
+We should normally center and reduce our data if the quantitative variables do not express the same data (the same unit of measurement). In our case, we don't need it because they all express a distance in mm. 
+```{r}
+# PCA
+res.pca <- PCA(df_billet[,2:7], 
+               scale.unit = TRUE,
+               graph = FALSE)
+
+# Eigenvalue
+eig.val <- get_eigenvalue(res.pca)
+eig.val
+
+# Scree Plot
+fviz_eig(res.pca, addlabels = TRUE, ylim = c(0,50))
+```
+
+#### Determining the number of components to be analyzed
+
+**Kaiser - Guttman Rule**
+The Kaiser rule is based on a simple idea. In a standardized PCA, the sum of the eigenvalues being equal to the number of variables, their average is 1. We therefore consider that an axis is interesting if its eigenvalue is greater than 1.
+
+**Karlis - Saporata - Spinaki (2003)**:\
+Threshold 1 would be too permissive. A more restrictive rule is to define it as follows: mean of the eigenvalues + 2 times their standard deviation (Saporta, 2006; page 172).
+The acceptance rule now becomes: $lambda > 1+2\sqrt{frac{p - 1}{n - 1}}$.
+
+Compared to Kaiser's rule, it is more restrictive. This goes in the desired direction. Let us also note that it depends on the "n:p" ratio, which is a determining factor in the quality of the PCA results. We will be all the more demanding - we will be inclined to accept fewer factors - the higher the number of variables "p" compared to the available observations "n". 
+
+In our case, we will use the Kaiser rule. Thus, we will take into account the **dimension 1 and dimension 2**, which gives us an explained variance of more than 60%.
+
+#### Quality of the representation of the variables
+```{r}
+# Graph of variables
+var <- get_pca_var(res.pca)
+
+# Coordinates
+var$coord[,1:2]
+# Cos2: quality
+var$cos2[,1:2]
+#Graph
+corrplot(var$cos2, 
+         is.corr=FALSE, method = "color", addCoef.col = "black",
+         col = colorRampPalette(c("white", "deepskyblue", "blue"))(100),
+         tl.col = "black", tl.srt = 45)
+
+# Contributions to the principal components
+var$contrib[,1:2]
+
+corrplot(var$contrib, 
+         is.corr=FALSE, method = "color", addCoef.col = "black",
+         col = colorRampPalette(c("white", "deepskyblue", "blue"))(100),
+         tl.col = "black", tl.srt = 45)
+
+# Visualization on correlation circle
+fviz_pca_var(res.pca, col.var = "black")
+
+```
+Axis 1 has a strong contribution between **lenght** in negative and **margin_low** in positive. The other variables, except **diagonal** have an impact on the positive axis. 
+We can see that the variable **diagonal** contributes strongly to Axis 2, in a positive way.
+
+```{r}
+# Description of dimensions
+res.desc <- dimdesc(res.pca, axes = c(1,2), proba = 0.05)
+
+# dim 1
+res.desc$Dim.1
+```
+
+#### Quality of representation of individuals
+```{r}
+# Graph of individuals
+ind <- get_pca_ind(res.pca)
+
+# Coordinates of individuals
+head(ind$coord)
+# Quality of the individuals
+head(ind$cos2)
+# Contributions of the individuals
+head(ind$contrib)
+
+# Graph of the individuals
+fviz_pca_ind(res.pca,
+             axes = c(1,2),
+             geom.ind = "point", # show points only
+             col.ind = df_billet$is_genuine, # color by is_genuine
+             addEllipses = TRUE, # concentration ellipses
+             legend.title = "Nature of the bills"
+             ) 
+```
+We can see a distinction between real and fake bills. \
+The **length** variable allows us to identify real bills more easily than fake ones. Conversely, the **margin_low** variable allows us to better identify counterfeit bills. 
+
+### Prediction method with K-means
+```{r}
+# Clustering with K-means
+# Mission K-means
+set.seed(123)
+kmeans.result <- kmeans(x = df_billet[,2:7], 2) # Cutting in 2 groups because we have 2 kinds of bills
+# Centroids of K-means
+kmeans.result$centers
+
+# Cluster list
+kmeans.clusters <- kmeans.result$cluster
+
+# Confusion Matrix
+cmat <- confusionMatrix(
+  table(
+    "reference" = factor(df_billet$is_genuine,
+                          levels = c("vrai_billet","faux_billet")),
+    "prediction" = factor(kmeans.clusters,
+                                        levels = c(1,2),
+                                        labels = c("vrai_billet","faux_billet"))
+  )
+)
+cmat
+# Graph
+fourfoldplot(cmat$table, color = c("#FFCAC9","#91FFB4"),
+             conf.level = 0, margin = 1
+             )
+
+
+# Visualization on the 1st factorial plane
+kmeans.acp.label <- factor(paste(kmeans.clusters, df_billet$is_genuine, sep = ' - '),
+                           levels = c("1 - vrai_billet","2 - vrai_billet", "2 - faux_billet", "1 - faux_billet"),
+                           labels = c("vrai positif", "faux positif", "vrai négatif","faux négatif"))
+
+fviz_pca_ind(res.pca,
+             axes = c(1,2),
+             geom.ind = "point", # show point only
+             col.ind = kmeans.acp.label,
+             legend.title = "Nature du billet",
+             mean_point = FALSE
+             )
+```
+The accuracy of the model is **`r round(as.vector(cmat$overall["Accuracy"]*100),3)`%**
+
+The sensitivity, or "rate of true positives", i.e. the percentage of individuals whose model correctly predicted the true bills is **`r round(as.vector(cmat$byClass["Sensitivity"]*100),3)`%**\
+The specificity, or "true negatives rate", i.e. the percentage of individuals whose model correctly predicted that they are not real tickets is **`r round(as.vector(cmat$byClass["Specificity"]*100),3)`%**.
+
+### Logistic regression 
+
+The objective of logistic regression is to model, to classify, a binary variable taking its values in {0,1} according to quantitative (and potentially qualitative) explanatory variables. Logistic regression is a (supervised) classification method that allows us to treat in our case the classification of bills as true or false. We will segment our data into training and test data and then evaluate our model on the untrained test data.
+```{r}
+# set.seed
+set.seed (123)
+
+# We partition our data with 80% in the train data and 20% in the test data
+training.samples <- df_billet$is_genuine %>% createDataPartition(p = 0.8, list = FALSE)
+train.data <- df_billet[training.samples, ]
+test.data <- df_billet[-training.samples, ]
+
+# Train :
+table(train.data$is_genuine)
+
+# Test
+table(test.data$is_genuine)
+```
+Multiple logistic regression is used to predict the probability of class membership as a function of several explanatory variables. 
+
+```{r}
+### Model calculation with the *stepwise* approach
+log.full_model <- glm(is_genuine ~., data = train.data, family = "binomial"(link="logit"))
+
+log.step_model <- stepAIC(log.full_model,
+        data = train.data,
+        direction ="both", trace = FALSE)
+
+test_model <- glm(is_genuine ~.-diagonal-height_left, data = train.data, family = "binomial")
+
+summary(log.full_model)
+summary(log.step_model)
+summary(test_model)
+
+# The selected variables and their coefficients
+log.step_model$coefficients
+```
+The best model is the model using step-wise. As a reminder, an explanation of the method has been described during the multiple linear regression. 
+
+### Application of the model on the test base | Prediction :
+```{r}
+# Prediction
+probabilities <- log.step_model %>% predict(test.data, type = "response") 
+predicted.classes <- ifelse(probabilities < 0.5, "vrai_billet", "faux_billet")
+
+# Model precision
+mean(predicted.classes == test.data$is_genuine)
+
+# Confusion Matrix
+log.cmat <- confusionMatrix(
+  table(
+  "prediction" = factor(predicted.classes,
+                        levels = c("vrai_billet", "faux_billet")),
+  "is_genuine" = factor(test.data$is_genuine,
+                        levels = c("vrai_billet", "faux_billet"))
+  )
+)
+log.cmat
+fourfoldplot(log.cmat$table, color = c("#FFCAC9","#91FFB4"),
+             conf.level = 0, margin = 1
+             )
+```
+The accuracy of the model is **`r round(as.vector(log.cmat$overall["Accuracy"]*100),3)`%**
+
+The sensitivity, or "rate of true positives", i.e. the percentage of individuals whose true tickets were correctly predicted by the model is **`r round(as.vector(log.cmat$byClass["Sensitivity"]*100),3)`%**\
+The specificity, or "true negatives rate", i.e. the percentage of individuals whose model correctly predicted that they are not real bills is **`r round(as.vector(log.cmat$byClass["Specificity"]*100),3)`%**.
+
+We will now project onto the 1st factorial plane of the PCA.
+```{r}
+# Projection sur le 1er plan factoriel
+acp_label = as.character(df_billet$is_genuine)
+acp_label[as.integer(rownames(test.data))] = "inconnu" # transformation ID in integer
+acp_label = factor(acp_label)
+
+vp_fn = factor(paste(test.data$is_genuine,predicted.classes))
+levels(vp_fn) = c('Vrai négatif','Faux Positif', 'Faux Négatif', 'Vrai Positif')
+names(vp_fn) = as.integer(rownames(test.data))
+
+# Calcul of the labels for the 2nd PCA
+acp_label2 = as.character(df_billet$is_genuine)
+names(acp_label2) = as.integer(rownames(df_billet))
+acp_label2[names(vp_fn)] = as.character(vp_fn)
+acp_label2 = as.factor(acp_label2)
+ 
+
+fig1 = fviz_pca_ind(res.pca, 
+             geom=c('point'),
+             pointshape = 19,
+             habillage = acp_label,
+             palette = c('#FFCAC9',  'black', '#91FFB4'), 
+             mean.point = FALSE,
+             legend.title = "Nature du billet"
+)
+fig1
+
+fig2 = fviz_pca_ind(res.pca, 
+             geom=c('point'),
+             pointshape = 19,
+             habillage = acp_label2,
+             palette = c('#000FB2', # faux négatif
+                         '#7B01B2', # faux positif
+                         '#FFCAC9', # faux billet 
+                         '#B20000', # vrai negatif
+                         '#00B233', # vrai positif
+                         '#91FFB4' # vrai billet
+                         ),
+             mean.point = FALSE,
+             legend.title = "Nature du billet"
+)
+fig2
+```
+
+### ROC and AUC Curve
+The Receiving Operator Characteristic (**ROC**) curve is commonly used to measure the performance of a classifier. Graphically, the ROC measure is often represented as a curve that gives the true positive rate as a function of the false positive rate.
+```{r, message = FALSE, warning=FALSE}
+roc(test.data$is_genuine ~ probabilities, plot = TRUE, print.auc = TRUE, col ="#00B233", lwd = 4, legacy.axes = TRUE, main = "ROC Curves")
+```
+An AUC score of 1 represents a perfect classifier, while a score of 0.5 represents a useless classifier. In our case, our classifier is 0.9998 which represents a perfect classifier. 
+
+### Application of the model on the production data provided by OpenClassrooms
+#### Logistic regression model
+```{r}
+# Importing the additional dataset
+df_billet_production <- read.csv2("data/billets_test.csv", sep = ",", dec = ".")
+
+
+# Test set
+probabilities_production <- log.step_model %>% predict(df_billet_production, type = "response")
+predicted.classes_production <- ifelse(probabilities_production < 0.5, "vrai_billet", "faux_billet") 
+
+df_billet_production["nature_billet"] <- predicted.classes_production
+df_billet_production["proba"] <- round(probabilities_production, 5)*100
+
+# Dataframe visualization
+kable(df_billet_production)%>%
+  kable_styling(latex_options = 'striped')
+```
+The final dataframe with the results of the classifications. For each banknote, the classification algorithm gives the probability that the banknote is false. If this probability is greater than or equal to 0.5, the bill is false. Conversely, it will be considered true if it is less than 0.5. 
+
+#### Model with the K-means method
+```{r}
+# Importing the additional dataset
+df_billet_production <- read.csv2("data/billets_test.csv", sep = ",", dec = ".")
+
+# Test set
+df_billet_production$prediction <- cl_predict(kmeans.result, 
+                                              df_billet_production %>% 
+                                                dplyr::select(-id))
+# Dataframe visualization
+kable(df_billet_production)%>%
+  kable_styling(latex_options = 'striped')
+```
+As a reminder, the K-means method gave us 2 different clusters. The **1** cluster belongs to the **true-ticket** while the **2** cluster belongs to the **false-ticket**.
+
+Therefore, no matter which method we use, we get the same result. Nevertheless, the **model with logistic regression is more accurate. 
+
+So we have a model for detecting counterfeit money. 
